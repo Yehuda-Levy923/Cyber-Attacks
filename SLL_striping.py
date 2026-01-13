@@ -3,6 +3,13 @@ from scapy.layers.inet import TCP, IP
 from scapy.layers.l2 import ARP, Ether
 import requests
 
+import logging
+import urllib3
+import warnings
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="scapy.sendrecv")
+
 IFACE = conf.iface
 GATEWAY = conf.route.route('0.0.0.0')[2]
 TARGET_SERVER = None
@@ -37,7 +44,7 @@ def setup_system():
         os.system(f"iptables -I FORWARD -s {v} -p tcp --dport 80 -m state --state NEW -j ACCEPT")
         os.system(f"iptables -I FORWARD -s {v} -p tcp --dport 443 -m state --state NEW -j ACCEPT")
 
-    print("""
+    print(r"""
 $$\       $$$$$$$$\ $$$$$$$$\       $$$$$$$$\ $$\   $$\ $$$$$$$$\        $$$$$$\   $$$$$$\  $$\      $$\ $$$$$$$$\  $$$$$$\
 $$ |      $$  _____|\__$$  __|      \__$$  __|$$ |  $$ |$$  _____|      $$  __$$\ $$  __$$\ $$$\    $$$ |$$  _____|$$  __$$\
 $$ |      $$ |         $$ |            $$ |   $$ |  $$ |$$ |            $$ /  \__|$$ /  $$ |$$$$\  $$$$ |$$ |      $$ /  \__|
@@ -210,7 +217,7 @@ def handle_packet(pkt):
 
 
 if __name__ == "__main__":
-    global IFACE, VICTIMS, TARGET_SERVER
+    IFACE, VICTIMS, TARGET_SERVER
     args = parse_arguments()
 
     if args.interface:
@@ -236,7 +243,7 @@ if __name__ == "__main__":
     finally:
         stop_event.set()
         cleanup_system()
-        print("""
+        print(r"""
                 $$$$$$\       $$\   $$\  $$$$$$\  $$\    $$\ $$$$$$$$\        $$$$$$\  $$$$$$$\   $$$$$$\  $$\   $$\ $$$$$$$$\ $$\   $$\
                 \_$$  _|      $$ |  $$ |$$  __$$\ $$ |   $$ |$$  _____|      $$  __$$\ $$  __$$\ $$  __$$\ $$ | $$  |$$  _____|$$$\  $$ |
                   $$ |        $$ |  $$ |$$ /  $$ |$$ |   $$ |$$ |            $$ /  \__|$$ |  $$ |$$ /  $$ |$$ |$$  / $$ |      $$$$\ $$ |
